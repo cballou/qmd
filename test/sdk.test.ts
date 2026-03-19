@@ -972,10 +972,12 @@ describe("embed", () => {
         maxBatchBytes: 1024 * 1024,
       });
 
+      // With section-aware chunking, api.md (which has a ## heading) produces
+      // 2 chunks (preamble + Endpoints section), so 4 total chunks across 3 docs
       expect(fakeLlm.embedBatchCalls).toHaveLength(3);
-      expect(fakeLlm.embedBatchCalls.map(call => call.length)).toEqual([1, 1, 1]);
+      expect(fakeLlm.embedBatchCalls.map(call => call.length)).toEqual([2, 1, 1]);
       expect(result.docsProcessed).toBe(3);
-      expect(result.chunksEmbedded).toBe(3);
+      expect(result.chunksEmbedded).toBe(4);
     } finally {
       setDefaultLlamaCpp(null);
       await store.close();

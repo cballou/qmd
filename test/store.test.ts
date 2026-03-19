@@ -25,6 +25,7 @@ import {
   getRealPath,
   hashContent,
   extractTitle,
+  stripFrontmatter,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   chunkDocument,
@@ -155,10 +156,12 @@ async function insertTestDocument(
   const hash = opts.hash || await hashContent(body);
 
   // Insert content (with OR IGNORE for deduplication)
+  // doc_fts stores frontmatter-stripped content for FTS indexing
+  const bodyFts = stripFrontmatter(body);
   db.prepare(`
-    INSERT OR IGNORE INTO content (hash, doc, created_at)
-    VALUES (?, ?, ?)
-  `).run(hash, body, now);
+    INSERT OR IGNORE INTO content (hash, doc, doc_fts, created_at)
+    VALUES (?, ?, ?, ?)
+  `).run(hash, body, bodyFts, now);
 
   // Insert document
   const result = db.prepare(`
@@ -576,6 +579,50 @@ describe("Embedding Formatting", () => {
   test("formatDocForEmbedding handles missing title", () => {
     const formatted = formatDocForEmbedding("Some content");
     expect(formatted).toBe("title: none | text: Some content");
+  });
+
+  test("formatDocForEmbedding includes section heading", () => {
+    const formatted = formatDocForEmbedding("Rule content", "My Doc", undefined, "Core Rules");
+    expect(formatted).toBe("title: My Doc > Core Rules | text: Rule content");
+  });
+
+  test("formatDocForEmbedding ignores empty section", () => {
+    const formatted = formatDocForEmbedding("Content", "Title", undefined, "");
+    expect(formatted).toBe("title: Title | text: Content");
+  });
+});
+
+// =============================================================================
+// Frontmatter Stripping Tests
+// =============================================================================
+
+describe("stripFrontmatter", () => {
+  test("strips YAML frontmatter from markdown", () => {
+    const content = `---
+title: Test
+status: active
+---
+# My Document
+
+Content here.`;
+    const stripped = stripFrontmatter(content);
+    expect(stripped).toBe("# My Document\n\nContent here.");
+  });
+
+  test("returns content unchanged when no frontmatter", () => {
+    const content = "# No Frontmatter\n\nJust content.";
+    expect(stripFrontmatter(content)).toBe(content);
+  });
+
+  test("returns content unchanged when frontmatter not closed", () => {
+    const content = "---\ntitle: Broken\n# Not closed";
+    expect(stripFrontmatter(content)).toBe(content);
+  });
+
+  test("handles empty content after frontmatter", () => {
+    const content = "---\ntitle: Empty\n---\n";
+    const stripped = stripFrontmatter(content);
+    expect(stripped).toBe("");
   });
 });
 

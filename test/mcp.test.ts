@@ -42,6 +42,7 @@ function initTestDatabase(db: Database): void {
     CREATE TABLE IF NOT EXISTS content (
       hash TEXT PRIMARY KEY,
       doc TEXT NOT NULL,
+      doc_fts TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL
     )
   `);
@@ -79,6 +80,7 @@ function initTestDatabase(db: Database): void {
       hash TEXT NOT NULL,
       seq INTEGER NOT NULL DEFAULT 0,
       pos INTEGER NOT NULL DEFAULT 0,
+      section TEXT NOT NULL DEFAULT '',
       model TEXT NOT NULL,
       embedded_at TEXT NOT NULL,
       PRIMARY KEY (hash, seq)
@@ -170,9 +172,9 @@ function seedTestData(db: Database): void {
   for (const doc of docs) {
     // Insert content first
     db.prepare(`
-      INSERT OR IGNORE INTO content (hash, doc, created_at)
-      VALUES (?, ?, ?)
-    `).run(doc.hash, doc.body, now);
+      INSERT OR IGNORE INTO content (hash, doc, doc_fts, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(doc.hash, doc.body, doc.body, now);
 
     // Then insert document metadata
     db.prepare(`
@@ -734,9 +736,9 @@ describe("MCP Server", () => {
 
       // Insert content first
       testDb.prepare(`
-        INSERT OR IGNORE INTO content (hash, doc, created_at)
-        VALUES (?, ?, ?)
-      `).run(hash, body, now);
+        INSERT OR IGNORE INTO content (hash, doc, doc_fts, created_at)
+        VALUES (?, ?, ?, ?)
+      `).run(hash, body, body, now);
 
       // Then insert document metadata
       testDb.prepare(`

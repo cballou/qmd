@@ -33,6 +33,7 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import { chunkDocumentBySections, shouldExcludeFile } from "./section-chunking.js";
 
 // =============================================================================
 // Configuration
@@ -656,13 +657,32 @@ function initializeDatabase(db: Database): void {
   db.exec(`DROP TABLE IF EXISTS collections`);
 
   // Content-addressable storage - the source of truth for document content
+  // doc_fts holds frontmatter-stripped content for FTS indexing
   db.exec(`
     CREATE TABLE IF NOT EXISTS content (
       hash TEXT PRIMARY KEY,
       doc TEXT NOT NULL,
+      doc_fts TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL
     )
   `);
+
+  // Migration: add doc_fts column if missing (existing databases)
+  const contentCols = db.prepare(`PRAGMA table_info(content)`).all() as { name: string }[];
+  let needsFtsRebuild = false;
+  if (!contentCols.some(col => col.name === 'doc_fts')) {
+    db.exec(`ALTER TABLE content ADD COLUMN doc_fts TEXT NOT NULL DEFAULT ''`);
+    needsFtsRebuild = true;
+  }
+  // Backfill empty doc_fts values from doc (strip frontmatter in JS, batch update)
+  const emptyFtsRows = db.prepare(`SELECT hash, doc FROM content WHERE doc_fts = ''`).all() as { hash: string; doc: string }[];
+  if (emptyFtsRows.length > 0) {
+    const updateStmt = db.prepare(`UPDATE content SET doc_fts = ? WHERE hash = ?`);
+    for (const row of emptyFtsRows) {
+      updateStmt.run(stripFrontmatter(row.doc), row.hash);
+    }
+    needsFtsRebuild = true;
+  }
 
   // Documents table - file system layer mapping virtual paths to content hashes
   // Collections are now managed in ~/.config/qmd/index.yml
@@ -706,11 +726,18 @@ function initializeDatabase(db: Database): void {
       hash TEXT NOT NULL,
       seq INTEGER NOT NULL DEFAULT 0,
       pos INTEGER NOT NULL DEFAULT 0,
+      section TEXT NOT NULL DEFAULT '',
       model TEXT NOT NULL,
       embedded_at TEXT NOT NULL,
       PRIMARY KEY (hash, seq)
     )
   `);
+
+  // Migration: add section column to existing content_vectors tables
+  const cvCols = db.prepare("PRAGMA table_info(content_vectors)").all() as { name: string }[];
+  if (!cvCols.some(c => c.name === 'section')) {
+    db.exec("ALTER TABLE content_vectors ADD COLUMN section TEXT NOT NULL DEFAULT ''");
+  }
 
   // Store collections — makes the DB self-contained (no external config needed)
   db.exec(`
@@ -742,8 +769,14 @@ function initializeDatabase(db: Database): void {
   `);
 
   // Triggers to keep FTS in sync
+  // Drop and recreate triggers to ensure they use doc_fts (frontmatter-stripped)
+  // instead of doc for the body column. Needed to migrate existing databases.
+  db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
+  db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
+  db.exec(`DROP TRIGGER IF EXISTS documents_au`);
+
   db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents
+    CREATE TRIGGER documents_ai AFTER INSERT ON documents
     WHEN new.active = 1
     BEGIN
       INSERT INTO documents_fts(rowid, filepath, title, body)
@@ -751,19 +784,19 @@ function initializeDatabase(db: Database): void {
         new.id,
         new.collection || '/' || new.path,
         new.title,
-        (SELECT doc FROM content WHERE hash = new.hash)
+        (SELECT doc_fts FROM content WHERE hash = new.hash)
       WHERE new.active = 1;
     END
   `);
 
   db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
+    CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
       DELETE FROM documents_fts WHERE rowid = old.id;
     END
   `);
 
   db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents
+    CREATE TRIGGER documents_au AFTER UPDATE ON documents
     BEGIN
       -- Delete from FTS if no longer active
       DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
@@ -774,10 +807,22 @@ function initializeDatabase(db: Database): void {
         new.id,
         new.collection || '/' || new.path,
         new.title,
-        (SELECT doc FROM content WHERE hash = new.hash)
+        (SELECT doc_fts FROM content WHERE hash = new.hash)
       WHERE new.active = 1;
     END
   `);
+
+  // Rebuild FTS index after migration to use frontmatter-stripped content
+  if (needsFtsRebuild) {
+    db.exec(`DELETE FROM documents_fts`);
+    db.exec(`
+      INSERT INTO documents_fts(rowid, filepath, title, body)
+      SELECT d.id, d.collection || '/' || d.path, d.title, c.doc_fts
+      FROM documents d
+      JOIN content c ON c.hash = d.hash
+      WHERE d.active = 1
+    `);
+  }
 }
 
 // =============================================================================
@@ -1213,6 +1258,7 @@ type EmbeddingDoc = PendingEmbeddingDoc & {
 type ChunkItem = {
   hash: string;
   title: string;
+  section: string;
   text: string;
   seq: number;
   pos: number;
@@ -1344,13 +1390,17 @@ export async function generateEmbeddings(
       for (const doc of batchDocs) {
         if (!doc.body.trim()) continue;
 
+        // Skip aggregate/changelog files from embedding (keep in FTS)
+        if (shouldExcludeFile(doc.path)) continue;
+
         const title = extractTitle(doc.body, doc.path);
-        const chunks = await chunkDocumentByTokens(doc.body);
+        const chunks = await chunkDocumentBySections(doc.body);
 
         for (let seq = 0; seq < chunks.length; seq++) {
           batchChunks.push({
             hash: doc.hash,
             title,
+            section: chunks[seq]!.section,
             text: chunks[seq]!.text,
             seq,
             pos: chunks[seq]!.pos,
@@ -1370,7 +1420,7 @@ export async function generateEmbeddings(
 
       if (!vectorTableInitialized) {
         const firstChunk = batchChunks[0]!;
-        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
+        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, undefined, firstChunk.section || undefined);
         const firstResult = await session.embed(firstText);
         if (!firstResult) {
           throw new Error("Failed to get embedding dimensions from first chunk");
@@ -1385,7 +1435,7 @@ export async function generateEmbeddings(
       for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
         const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
         const chunkBatch = batchChunks.slice(batchStart, batchEnd);
-        const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+        const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, undefined, chunk.section || undefined));
 
         try {
           const embeddings = await session.embedBatch(texts);
@@ -1393,7 +1443,7 @@ export async function generateEmbeddings(
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
             if (embedding) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.section);
               chunksEmbedded++;
             } else {
               errors++;
@@ -1404,10 +1454,10 @@ export async function generateEmbeddings(
           // Batch failed — try individual embeddings as fallback
           for (const chunk of chunkBatch) {
             try {
-              const text = formatDocForEmbedding(chunk.text, chunk.title);
+              const text = formatDocForEmbedding(chunk.text, chunk.title, undefined, chunk.section || undefined);
               const result = await session.embed(text);
               if (result) {
-                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.section);
                 chunksEmbedded++;
               } else {
                 errors++;
@@ -1638,6 +1688,7 @@ export type SearchResult = DocumentResult & {
   score: number;              // Relevance score (0-1)
   source: "fts" | "vec";      // Search source (full-text or vector)
   chunkPos?: number;          // Character position of matching chunk (for vector search)
+  chunkSection?: string;      // Section heading of matching chunk (for vector search)
 };
 
 /**
@@ -1923,16 +1974,34 @@ export function extractTitle(content: string, filename: string): string {
 }
 
 // =============================================================================
+// Frontmatter stripping
+// =============================================================================
+
+/**
+ * Strip YAML frontmatter (between `---` delimiters) from markdown content.
+ * Returns the content unchanged if no valid frontmatter is found.
+ */
+export function stripFrontmatter(content: string): string {
+  if (!content.startsWith('---')) return content;
+  const end = content.indexOf('\n---', 3);
+  if (end === -1) return content;
+  return content.substring(end + 4).trimStart();
+}
+
+// =============================================================================
 // Document indexing operations
 // =============================================================================
 
 /**
  * Insert content into the content table (content-addressable storage).
  * Uses INSERT OR IGNORE so duplicate hashes are skipped.
+ * Stores both raw content (doc) and frontmatter-stripped content (doc_fts)
+ * so that FTS indexing excludes YAML frontmatter.
  */
 export function insertContent(db: Database, hash: string, content: string, createdAt: string): void {
-  db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
-    .run(hash, content, createdAt);
+  const strippedContent = stripFrontmatter(content);
+  db.prepare(`INSERT OR IGNORE INTO content (hash, doc, doc_fts, created_at) VALUES (?, ?, ?, ?)`)
+    .run(hash, content, strippedContent, createdAt);
 }
 
 /**
@@ -2771,7 +2840,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       d.title,
       content.doc as body,
       d.hash,
-      bm25(documents_fts, 10.0, 1.0) as bm25_score
+      bm25(documents_fts, 1.0, 5.0, 1.0) as bm25_score
     FROM documents_fts f
     JOIN documents d ON d.id = f.rowid
     JOIN content ON content.hash = d.hash
@@ -2849,6 +2918,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
       cv.hash || '_' || cv.seq as hash_seq,
       cv.hash,
       cv.pos,
+      cv.section,
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
@@ -2866,7 +2936,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
   }
 
   const docRows = db.prepare(docSql).all(...params) as {
-    hash_seq: string; hash: string; pos: number; filepath: string;
+    hash_seq: string; hash: string; pos: number; section: string; filepath: string;
     display_path: string; title: string; body: string;
   }[];
 
@@ -2899,6 +2969,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
         score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
         chunkPos: row.pos,
+        chunkSection: row.section || undefined,
       };
     });
 }
@@ -2951,14 +3022,15 @@ export function insertEmbedding(
   pos: number,
   embedding: Float32Array,
   model: string,
-  embeddedAt: string
+  embeddedAt: string,
+  section: string = '',
 ): void {
   const hashSeq = `${hash}_${seq}`;
   const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
-  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, ?, ?)`);
+  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, section, model, embedded_at) VALUES (?, ?, ?, ?, ?, ?)`);
 
   insertVecStmt.run(hashSeq, embedding);
-  insertContentVectorStmt.run(hash, seq, pos, model, embeddedAt);
+  insertContentVectorStmt.run(hash, seq, pos, section, model, embeddedAt);
 }
 
 // =============================================================================
