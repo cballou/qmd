@@ -2629,6 +2629,7 @@ function showHelp(): void {
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
+  console.log("  --intent <text>            - Background context to disambiguate query (e.g. 'web performance')");
   console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
   console.log("  --line-numbers             - Include line numbers in output");
   console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
