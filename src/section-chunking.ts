@@ -1,53 +1,106 @@
 /**
- * section-chunking.ts - Section-aware document chunking for markdown files.
+ * section-chunking.ts - Section provenance and embedding-noise exclusion.
  *
- * Splits markdown documents by ## headings into section-aware chunks,
- * preserving section context for better embedding quality.
- * Also provides file exclusion logic for aggregate/changelog files
- * that add noise to vector search.
+ * Upstream 2.1.0 replaced our bespoke `##`-splitting chunker with an AST-aware
+ * one (tree-sitter for code, heading-scored boundaries for prose), so the
+ * splitting half of this module is gone. What upstream still does not carry is
+ * *provenance*: its chunks are `{ text, pos, tokens }` with no record of which
+ * section a chunk came from, and we embed as `title > section | text` so a
+ * heading's words reach the vector even when the chunk body omits them.
+ *
+ * So this module now maps a chunk's character offset back to its enclosing
+ * markdown heading, and keeps the two exclusion policies (noise sections, and
+ * aggregate/changelog files) that upstream has no equivalent for.
  */
-
-import { getDefaultLlamaCpp } from "./llm.js";
-import { CHUNK_SIZE_TOKENS, CHUNK_OVERLAP_TOKENS } from "./store.js";
 
 // =============================================================================
-// Section-Aware Chunking
+// Section provenance
 // =============================================================================
 
-export interface SectionChunk {
-  section: string;   // Section heading (e.g. "Core Rules"), empty for preamble
-  text: string;      // Chunk text content
-  pos: number;       // Character position in original document
-  tokens: number;    // Estimated token count
-  bytes: number;     // Byte length of text
+/** A markdown heading and the character offset at which its body starts. */
+export interface SectionMarker {
+  /** Character offset of the heading line in the source document. */
+  pos: number;
+  /** Heading text, e.g. "Core Rules". */
+  heading: string;
 }
 
-/**
- * Estimate token count from text.
- * Uses a conservative ~4 chars per token for prose, which is a reasonable
- * approximation for markdown content without requiring the LLM tokenizer.
- */
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
+/** Matches ATX headings at level 2+ (`## ...`), which is how our notes divide. */
+const SECTION_HEADING = /^(#{2,6})\s+(.+?)\s*#*\s*$/gm;
+
+/** Fenced code blocks — `## ` inside one is a comment, not a heading. */
+const FENCE = /^(?:```|~~~)/gm;
 
 /**
- * Count actual tokens using the LLM tokenizer if available,
- * falling back to estimation.
+ * Character ranges covered by fenced code blocks, so heading detection can
+ * skip them. An unterminated fence runs to end of document.
  */
-async function countTokens(text: string): Promise<number> {
-  try {
-    const llm = getDefaultLlamaCpp();
-    const count = await llm.countTokens(text);
-    return count ?? estimateTokens(text);
-  } catch {
-    return estimateTokens(text);
+function fencedRanges(content: string): [number, number][] {
+  const ranges: [number, number][] = [];
+  FENCE.lastIndex = 0;
+  let open: number | null = null;
+  for (let m = FENCE.exec(content); m; m = FENCE.exec(content)) {
+    if (open === null) open = m.index;
+    else {
+      ranges.push([open, m.index + m[0].length]);
+      open = null;
+    }
   }
+  if (open !== null) ranges.push([open, content.length]);
+  return ranges;
 }
 
 /**
- * Sections to exclude from embedding because they contain noise
- * (boilerplate, auto-generated content, etc.)
+ * Build the ordered list of section markers for a document.
+ *
+ * Built once per document and reused across its chunks: doing this per chunk
+ * would rescan the whole document for every chunk it produced.
+ */
+export function buildSectionMap(content: string): SectionMarker[] {
+  const fences = fencedRanges(content);
+  const inFence = (pos: number) => fences.some(([a, b]) => pos >= a && pos < b);
+
+  const markers: SectionMarker[] = [];
+  SECTION_HEADING.lastIndex = 0;
+  for (let m = SECTION_HEADING.exec(content); m; m = SECTION_HEADING.exec(content)) {
+    if (inFence(m.index)) continue;
+    markers.push({ pos: m.index, heading: m[2]!.trim() });
+  }
+  return markers;
+}
+
+/**
+ * The section a chunk starting at `pos` belongs to, or "" for preamble content
+ * ahead of the first heading.
+ *
+ * Upstream's chunker prefers heading boundaries but does not guarantee them, so
+ * a chunk can straddle two sections; we attribute it to the section it starts
+ * in. Binary search keeps this O(log n) per chunk.
+ */
+export function sectionAtPosition(markers: SectionMarker[], pos: number): string {
+  let lo = 0;
+  let hi = markers.length - 1;
+  let found = "";
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (markers[mid]!.pos <= pos) {
+      found = markers[mid]!.heading;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return found;
+}
+
+// =============================================================================
+// Embedding-noise exclusion
+// =============================================================================
+
+/**
+ * Sections that are bookkeeping rather than content. They are still reachable
+ * by keyword search via FTS; excluding them keeps vector search from surfacing
+ * a note's changelog instead of its substance.
  */
 const EXCLUDED_SECTION_PATTERNS = [
   /^recent\s+activity$/i,
@@ -57,177 +110,10 @@ const EXCLUDED_SECTION_PATTERNS = [
   /^version\s+history$/i,
 ];
 
-function shouldExcludeSection(heading: string): boolean {
+/** Whether a section heading names bookkeeping we do not want embedded. */
+export function shouldExcludeSection(heading: string): boolean {
   return EXCLUDED_SECTION_PATTERNS.some(pat => pat.test(heading.trim()));
 }
-
-/**
- * Split a markdown document into section-aware chunks.
- *
- * Strategy:
- * 1. Split by ## headings (level 2) into logical sections
- * 2. Each section becomes one chunk if it fits within token budget
- * 3. Oversized sections are split at paragraph boundaries with overlap
- * 4. Preamble (content before first ##) gets section=""
- * 5. Sections matching noise patterns (Recent Activity, etc.) are excluded
- *
- * Returns chunks with section names for embedding context.
- */
-export async function chunkDocumentBySections(
-  body: string,
-  maxTokens: number = CHUNK_SIZE_TOKENS,
-  overlapTokens: number = CHUNK_OVERLAP_TOKENS,
-): Promise<SectionChunk[]> {
-  const encoder = new TextEncoder();
-  const chunks: SectionChunk[] = [];
-
-  // Split by ## headings, keeping the heading with its content
-  const sectionPattern = /^## (.+)$/gm;
-  const sections: { heading: string; text: string; pos: number }[] = [];
-
-  let lastIndex = 0;
-  let lastHeading = "";
-  let match: RegExpExecArray | null;
-
-  // Collect all ## heading positions
-  const headingMatches: { heading: string; index: number }[] = [];
-  while ((match = sectionPattern.exec(body)) !== null) {
-    headingMatches.push({ heading: match[1]!, index: match.index });
-  }
-
-  // Build sections from heading positions
-  for (let i = 0; i < headingMatches.length; i++) {
-    const hm = headingMatches[i]!;
-    // Content before this heading belongs to previous section
-    if (hm.index > lastIndex) {
-      sections.push({
-        heading: lastHeading,
-        text: body.slice(lastIndex, hm.index).trim(),
-        pos: lastIndex,
-      });
-    }
-    lastHeading = hm.heading;
-    lastIndex = hm.index;
-  }
-
-  // Remaining content after last heading (or entire doc if no headings)
-  if (lastIndex < body.length) {
-    sections.push({
-      heading: lastHeading,
-      text: body.slice(lastIndex).trim(),
-      pos: lastIndex,
-    });
-  }
-
-  // Process each section
-  for (const section of sections) {
-    if (!section.text) continue;
-
-    // Skip noise sections
-    if (section.heading && shouldExcludeSection(section.heading)) continue;
-
-    const tokens = await countTokens(section.text);
-
-    if (tokens <= maxTokens) {
-      // Section fits in one chunk
-      chunks.push({
-        section: section.heading,
-        text: section.text,
-        pos: section.pos,
-        tokens,
-        bytes: encoder.encode(section.text).length,
-      });
-    } else {
-      // Section too large — split at paragraph boundaries
-      const subChunks = await splitSectionByParagraphs(
-        section.text,
-        section.heading,
-        section.pos,
-        maxTokens,
-        overlapTokens,
-      );
-      chunks.push(...subChunks);
-    }
-  }
-
-  // If no chunks produced (empty doc or all sections excluded), return single chunk
-  if (chunks.length === 0 && body.trim()) {
-    const text = body.trim();
-    const tokens = await countTokens(text);
-    chunks.push({
-      section: "",
-      text,
-      pos: 0,
-      tokens,
-      bytes: encoder.encode(text).length,
-    });
-  }
-
-  return chunks;
-}
-
-/**
- * Split an oversized section at paragraph boundaries (\n\n).
- * Adds overlap between chunks for context continuity.
- */
-async function splitSectionByParagraphs(
-  text: string,
-  heading: string,
-  basePos: number,
-  maxTokens: number,
-  overlapTokens: number,
-): Promise<SectionChunk[]> {
-  const encoder = new TextEncoder();
-  const paragraphs = text.split(/\n\n+/);
-  const chunks: SectionChunk[] = [];
-
-  let currentText = "";
-  let currentTokens = 0;
-  let currentPos = basePos;
-
-  for (const para of paragraphs) {
-    const paraTokens = await countTokens(para);
-
-    if (currentTokens + paraTokens > maxTokens && currentText) {
-      // Emit current chunk
-      const trimmed = currentText.trim();
-      chunks.push({
-        section: heading,
-        text: trimmed,
-        pos: currentPos,
-        tokens: currentTokens,
-        bytes: encoder.encode(trimmed).length,
-      });
-
-      // Start new chunk with overlap: keep the last paragraph for context
-      const overlapText = currentText.slice(-(overlapTokens * 4));
-      currentText = overlapText + "\n\n" + para;
-      currentTokens = await countTokens(currentText);
-      currentPos = basePos + text.indexOf(para);
-    } else {
-      currentText += (currentText ? "\n\n" : "") + para;
-      currentTokens += paraTokens;
-    }
-  }
-
-  // Emit final chunk
-  if (currentText.trim()) {
-    const trimmed = currentText.trim();
-    chunks.push({
-      section: heading,
-      text: trimmed,
-      pos: currentPos,
-      tokens: await countTokens(trimmed),
-      bytes: encoder.encode(trimmed).length,
-    });
-  }
-
-  return chunks;
-}
-
-// =============================================================================
-// File Exclusion
-// =============================================================================
 
 /**
  * Patterns for files that should be excluded from vector embedding.
